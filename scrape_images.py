@@ -55,20 +55,18 @@ class RedditScraper():
 
     def __init__(self, subreddit):
         self.subreddit = subreddit
-        # Would we ever want to do multiple scrapes in this file? if so, make this global
+        # Would we ever want to do multiple subreddit scrapes in this file? if so, make this global
         self.access_token = authorize_reddit()
         self.existing_image_set = self.get_existing_image_set()
 
     def scrape_and_store(self, n=None):
         subreddit_json = self.get_hot_subreddit_response()
+        # print(json.dumps(subreddit_json, indent=2))
         images = list(self.build_image_objects(subreddit_json))
         filtered_images = self.filter_downloadable_images(images, n)
-
-        # self.prepare_to_download_images()
+        self.prepare_to_download_images()
         self.download_images(filtered_images)
-        # except Exception:
         self.upload_images(filtered_images)
-        # wrap up
         self.update_existing_image_set(images)
 
 
@@ -102,6 +100,10 @@ class RedditScraper():
 
 
     def filter_downloadable_images(self, images, n):
+        for image in images:
+            if not image.can_download():
+                print('NOT ', image.url)
+
         filtered_images = [image for image in images 
             if image.can_download() 
             and image.id not in self.existing_image_set]     
@@ -153,25 +155,27 @@ class RedditScraper():
     def upload_images(self, images):
         client = boto3.client('s3')
 
-        for i, image in enumerate(images):
+        for image in images:
             try:
                 current_dir = get_current_dir()
                 with open("{dir}/{sub}/images/{f}".format(
                     dir=current_dir, 
                     sub=self.subreddit, 
                     f=image.id), 'rb') as image_file:
+
+                    object_name = "{sub}/{id}".format(sub=self.subreddit, id=image.id)
                     client.upload_fileobj(
                         image_file,
                         CURRENT_BUCKET,
-                        # object name (currently URL but that might not be the best thing)
-                        Key=image.id 
+                        # object name (subreddit/id - eg memes/adef1223f47bc95bc95 )
+                        Key=object_name
                     )
 
                     print(image.get_tag_set())
 
                     client.put_object_tagging(
                         Bucket=CURRENT_BUCKET,
-                        Key=image.id,
+                        Key=object_name,
                         Tagging={
                             'TagSet': image.get_tag_set()
                         }
@@ -199,8 +203,12 @@ class Image():
         self.id = hashlib.md5(self.url.encode()).hexdigest()
 
     def can_download(self):
+        is_reddit_video = self.post_json["secure_media"] is not None and "reddit_video" in self.post_json["secure_media"]
         return self.post_json["thumbnail"] != "" \
-            and "preview" in self.post_json
+            and "preview" in self.post_json \
+            and not self.post_json["url"].startswith("https://www.reddit.com/r/") \
+            and not (self.post_json["url"].endswith('gif') or self.post_json["url"].endswith('gifv')) \
+            and not is_reddit_video
 
 
     def get_tag_set(self):
