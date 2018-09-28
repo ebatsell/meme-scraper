@@ -20,6 +20,7 @@ client_auth = requests.auth.HTTPBasicAuth(client_id, client_secret)
 USER_AGENT_STR = 'request:from:meme:scraper:project:by:evan'
 
 CURRENT_BUCKET = 'reddit-memes'
+CURRENT_TABLE = 'meme-metadata'
 SUBREDDIT = None
 
 def authorize_reddit():
@@ -51,13 +52,15 @@ def get_current_dir():
 
 class RedditScraper():
     """Reddit Scraper object that scrapes and stores all hot images from its subreddit."""
-
-
     def __init__(self, subreddit):
         self.subreddit = subreddit
         # Would we ever want to do multiple subreddit scrapes in this file? if so, make this global
         self.access_token = authorize_reddit()
         self.existing_image_set = self.get_existing_image_set()
+
+    @staticmethod
+    def get_source():
+        return "reddit.com"
 
     def scrape_and_store(self, n=None):
         subreddit_json = self.get_hot_subreddit_response()
@@ -107,14 +110,12 @@ class RedditScraper():
         filtered_images = [image for image in images 
             if image.can_download() 
             and image.id not in self.existing_image_set]     
-        if n:
-            filtered_images = filtered_images[0:n]
-        return filtered_images
+
+        return filtered_images[0:n] if n else filtered_images
 
     # this step filters duplicates and non-images, and builds Image objects
     def build_image_objects(self, subreddit_json):
         posts = [child["data"] for child in subreddit_json["data"]["children"]]
-        # posts = posts[0:3] # for testing purposes only
         for post in posts:
             # we want to filter videos, gifs, and text posts
             # so we get only images
@@ -128,9 +129,9 @@ class RedditScraper():
             post_votes = post["score"]
             post_title = post["title"]
             post_timestamp_utc = post["created_utc"]
-            post_subreddit = post["subreddit_name_prefixed"]
-
-            yield Image(post_title, post_url, post_timestamp_utc, post_votes, post_subreddit, post)
+            post_comments = post["num_comments"]
+            print(json.dumps(post, indent=2))
+            yield Image(post_title, post_url, post_timestamp_utc, post_votes, post_comments, self.subreddit, post)
 
     def prepare_to_download_images(self):
         current_dir = get_current_dir()
@@ -145,7 +146,11 @@ class RedditScraper():
             print(image.url)
             try:
                 current_dir = get_current_dir()
-                wget.download(image.url, out="{dir}/{sub}/images/{f}".format(dir=current_dir, sub=self.subreddit, f=image.id))
+                wget.download(image.url, out="{dir}/{sub}/images/{f}".format(
+                    dir=current_dir, 
+                    sub=self.subreddit, 
+                    f=image.id)
+                )
             except FileNotFoundError:
                 continue
             time.sleep(5)
@@ -153,34 +158,35 @@ class RedditScraper():
 
 
     def upload_images(self, images):
-        client = boto3.client('s3')
 
         for image in images:
             try:
-                current_dir = get_current_dir()
-                with open("{dir}/{sub}/images/{f}".format(
-                    dir=current_dir, 
-                    sub=self.subreddit, 
-                    f=image.id), 'rb') as image_file:
+                image.upload_image()
+                # current_dir = get_current_dir()
+                # with open("{dir}/{sub}/images/{f}".format(
+                #     dir=current_dir, 
+                #     sub=self.subreddit, 
+                #     f=image.id), 'rb') as image_file:
 
-                    object_name = "{sub}/{id}".format(sub=self.subreddit, id=image.id)
-                    client.upload_fileobj(
-                        image_file,
-                        CURRENT_BUCKET,
-                        # object name (subreddit/id - eg memes/adef1223f47bc95bc95 )
-                        Key=object_name
-                    )
+                #     object_name = "{sub}/{id}".format(sub=self.subreddit, id=image.id)
+                #     client.upload_fileobj(
+                #         image_file,
+                #         CURRENT_BUCKET,
+                #         # object name (subreddit/id - eg memes/adef1223f47bc95bc95 )
+                #         Key=object_name
+                #     )
 
-                    print(image.get_tag_set())
+                #     print(image.get_tag_set())
 
-                    client.put_object_tagging(
-                        Bucket=CURRENT_BUCKET,
-                        Key=object_name,
-                        Tagging={
-                            'TagSet': image.get_tag_set()
-                        }
-                    )
+                #     client.put_object_tagging(
+                #         Bucket=CURRENT_BUCKET,
+                #         Key=object_name,
+                #         Tagging={
+                #             'TagSet': image.get_tag_set()
+                #         }
+                #     )
             except FileNotFoundError:
+                print("File not found for image {}".format(image.id))
                 continue
 
 
@@ -193,13 +199,14 @@ class RedditScraper():
 
 class Image():
     """Image class that stores metadata about an image and its ability to be scraped"""
-    def __init__(self, title, url, timestamp, votes, community, post_json):
+    def __init__(self, title, url, timestamp, votes, num_comments, subreddit, post_json):
         self.title = title
         self.url = url
         self.timestamp = timestamp
         self.votes = votes
-        self.community = community
+        self.subreddit = subreddit
         self.post_json = post_json
+        self.comments = num_comments
         self.id = hashlib.md5(self.url.encode()).hexdigest()
 
     def can_download(self):
@@ -230,8 +237,8 @@ class Image():
                 'Value': str(self.votes),
             },
             {
-                'Key': 'community',
-                'Value': self.community,
+                'Key': 'subreddit',
+                'Value': self.subreddit,
             },
             {
                 'Key': 'id',
@@ -239,8 +246,103 @@ class Image():
             },
         ]
 
-    def get_image_file_path(self):
-        pass
+    def upload_image(self):
+        object_name = "{sub}/{id}".format(sub=self.subreddit, id=self.id)
+        self._load_file_in_s3_bucket(object_name)
+        self._add_s3_tagging(object_name)
+        self._update_dynamodb(object_name)
+
+
+    def is_in_db(self, response):
+        client = boto3.client('dynamodb')
+        
+
+        # This is the condition for 
+        return 'Item' in response
+
+    def _load_file_in_s3_bucket(self, object_name):
+        client = boto3.client('s3')
+        current_dir = get_current_dir()
+        with open("{dir}/{sub}/images/{f}".format(
+            dir=current_dir, 
+            sub=self.subreddit, 
+            f=self.id), 'rb') as image_file:
+
+            client.upload_fileobj(
+                image_file,
+                CURRENT_BUCKET,
+                # object name (subreddit/id - eg memes/adef1223f47bc95bc95 )
+                Key=object_name
+            )
+
+    def _add_s3_tagging(self, object_name):
+        client = boto3.client('s3')
+        client.put_object_tagging(
+            Bucket=CURRENT_BUCKET,
+            Key=object_name,
+            Tagging={
+                'TagSet': self.get_tag_set()
+            }
+        )
+
+    def _update_dynamodb(self, object_name):
+        ''' fields:
+        "id": self.id # Primary Key
+        "s3_key": object_name
+        "s3_bucket": CURRENT_BUCKET
+        "title": self.title # synonymous with caption
+        "url": self.url
+        "engagement": {
+            "timestamps": [],
+            "score": [], # likes (twitter, ig), upvotes (reddit), reactions (fb)
+            "num_comments": [],
+        } 
+        '''
+        client = boto3.client('dynamodb')
+        response = client.get_item(
+            TableName=CURRENT_TABLE,
+            Item={'id': {'S': self.id}}
+        )
+        print(response)
+        # put item for new ones, update item for old ones
+        if self.is_in_db(response):
+            # update item
+            num_scores = len(response['engagement']['scores'])
+            # we want to insert new scores, timestamps, and comments at the back of the list
+
+            # client.update_item(
+            #     TableName=CURRENT_TABLE,
+            #     Key={'id': {'S': self.id}},
+            #     UpdateExpression='SET resp'
+            # )
+        else:
+            client.put_item(
+                TableName=CURRENT_TABLE,
+                Item={
+                    'community': {'S': self.subreddit},
+                    'content_source': {'S': RedditScraper.get_source()},
+                    's3_key': {'S': object_name},
+                    's3_bucket': {'S': CURRENT_BUCKET},
+                    'image_url': {'S': self.url},
+                    'id': {'S': self.id}, # Primary Key
+                    'engagement': {
+                        'M': {
+                            "timestamps": {
+                                "L": [{'N': str(self.timestamp)}]
+                            },
+                            "scores": {
+                                "L": [{'N': str(self.votes)}]
+                            },
+                            "num_comments": {
+                                "L": [{'N': str(self.comments)}]
+                            },
+                        }
+                    }
+
+                } 
+            )
+
+
 
 @click.command()
 @click.argument('subreddit', nargs=1)
