@@ -1,3 +1,4 @@
+import datetime
 import hashlib
 import json
 import os
@@ -64,13 +65,22 @@ class RedditScraper():
 
     def scrape_and_store(self, n=None):
         subreddit_json = self.get_hot_subreddit_response()
-        # print(json.dumps(subreddit_json, indent=2))
-        images = list(self.build_image_objects(subreddit_json))
-        filtered_images = self.filter_downloadable_images(images, n)
-        self.prepare_to_download_images()
-        self.download_images(filtered_images)
-        self.upload_images(filtered_images)
-        self.update_existing_image_set(images)
+        print(json.dumps(subreddit_json, indent=2))
+        content = list(self.build_image_objects(subreddit_json))
+        images = self.filter_images_from_content(content)
+        new_images, old_images = self.filter_new_images(images)
+        print('new images')
+        print([image.id for image in new_images])
+        print('old images')
+        print([image.id for image in old_images])
+        # Restrict number of new images for testing so it goes faster
+        if n:
+            new_images = new_images[0:n]
+        self.prepare_to_download_images() # currently removes image files - will want to change to keeping images only in memory
+        self.download_new_images(new_images)
+        self.upload_new_images(new_images)
+        self.update_old_images(old_images)
+        self.update_existing_image_set_file(images)
 
 
     def get_existing_image_set(self):
@@ -101,12 +111,29 @@ class RedditScraper():
         json_response = json.loads(response.text)
         return json_response
 
+    def filter_images_from_content(self, content_objects):
+        filtered_images = [image for image in content_objects if image.can_download()]
+        return filtered_images 
 
-    def filter_downloadable_images(self, images, n):
+    def filter_new_images(self, images):
+        ''' Returns a tuple of two lists (new, old) where new is images that
+        have never been seen before and old is the images that are not new. '''
+        old_images = []
+        new_images = []
+
         for image in images:
-            if not image.can_download():
-                print('NOT ', image.url)
+            # If they are in the existing_image_set they are guaranteed to be old
+            if image.id in self.existing_image_set:
+                old_images.append(image)
+            elif image.is_in_db():
+                old_images.append(image)
+            else:
+                new_images.append(image)
 
+        return (new_images, old_images)
+
+    # deprecated...
+    def filter_downloadable_images(self, images, n):
         filtered_images = [image for image in images 
             if image.can_download() 
             and image.id not in self.existing_image_set]     
@@ -130,8 +157,9 @@ class RedditScraper():
             post_title = post["title"]
             post_timestamp_utc = post["created_utc"]
             post_comments = post["num_comments"]
-            print(json.dumps(post, indent=2))
-            yield Image(post_title, post_url, post_timestamp_utc, post_votes, post_comments, self.subreddit, post)
+            subreddit_size = post["subreddit_subscribers"]
+            # print(json.dumps(post, indent=2))
+            yield Image(post_title, post_url, post_timestamp_utc, post_votes, post_comments, self.subreddit, subreddit_size, post)
 
     def prepare_to_download_images(self):
         current_dir = get_current_dir()
@@ -140,8 +168,8 @@ class RedditScraper():
             os.remove(os.path.join(path, f))
 
     # Iteration 1: wget
-    #   having some throttling issues
-    def download_images(self, images):
+    #   having some throttling issues - t=5s seems to do the trick
+    def download_new_images(self, images):
         for image in images:
             print(image.url)
             try:
@@ -156,55 +184,35 @@ class RedditScraper():
             time.sleep(5)
 
 
-
-    def upload_images(self, images):
-
+    def upload_new_images(self, images):
         for image in images:
             try:
                 image.upload_image()
-                # current_dir = get_current_dir()
-                # with open("{dir}/{sub}/images/{f}".format(
-                #     dir=current_dir, 
-                #     sub=self.subreddit, 
-                #     f=image.id), 'rb') as image_file:
-
-                #     object_name = "{sub}/{id}".format(sub=self.subreddit, id=image.id)
-                #     client.upload_fileobj(
-                #         image_file,
-                #         CURRENT_BUCKET,
-                #         # object name (subreddit/id - eg memes/adef1223f47bc95bc95 )
-                #         Key=object_name
-                #     )
-
-                #     print(image.get_tag_set())
-
-                #     client.put_object_tagging(
-                #         Bucket=CURRENT_BUCKET,
-                #         Key=object_name,
-                #         Tagging={
-                #             'TagSet': image.get_tag_set()
-                #         }
-                #     )
-            except FileNotFoundError:
+            except FileNotFoundError: # is this really necessary
                 print("File not found for image {}".format(image.id))
                 continue
 
+    def update_old_images(self, old_images):
+        for image in old_images:
+            image.update_image() # can we get much simpler?
 
-    def update_existing_image_set(self, images):
+    def update_existing_image_set_file(self, images):
         current_dir = get_current_dir()
 
         with open("{}/{}/last_files.txt".format(current_dir, self.subreddit), 'w+') as f:
-            for image in images:        
+            for image in images:
                 f.write(image.id + os.linesep)
+
 
 class Image():
     """Image class that stores metadata about an image and its ability to be scraped"""
-    def __init__(self, title, url, timestamp, votes, num_comments, subreddit, post_json):
+    def __init__(self, title, url, timestamp, votes, num_comments, subreddit, subreddit_size, post_json):
         self.title = title
         self.url = url
-        self.timestamp = timestamp
+        self.created = timestamp
         self.votes = votes
         self.subreddit = subreddit
+        self.subreddit_size = subreddit_size
         self.post_json = post_json
         self.comments = num_comments
         self.id = hashlib.md5(self.url.encode()).hexdigest()
@@ -221,24 +229,12 @@ class Image():
     def get_tag_set(self):
         return [
             {
-                'Key': 'title',
-                'Value': s3tagfilter(self.title),
-            },
-            {
                 'Key': 'url',
                 'Value': self.url,
             },
             {
-                'Key': 'timestamp',
-                'Value': str(self.timestamp),
-            },
-            {
-                'Key': 'votes',
-                'Value': str(self.votes),
-            },
-            {
-                'Key': 'subreddit',
-                'Value': self.subreddit,
+                'Key': 'content_source',
+                'Value': RedditScraper.get_source()
             },
             {
                 'Key': 'id',
@@ -250,14 +246,47 @@ class Image():
         object_name = "{sub}/{id}".format(sub=self.subreddit, id=self.id)
         self._load_file_in_s3_bucket(object_name)
         self._add_s3_tagging(object_name)
-        self._update_dynamodb(object_name)
+        self._put_dynamodb(object_name)
 
-
-    def is_in_db(self, response):
+    def update_image(self):
         client = boto3.client('dynamodb')
-        
+        response = client.get_item( # switch to batch get item to optimize DB calls
+            TableName=CURRENT_TABLE,
+            Key={'id': {'S': self.id}}
+        )
 
-        # This is the condition for 
+        if 'Item' not in response:
+            print('Image we want to update does not exist in the database yet, id=' + self.id) 
+            self.upload_image()
+            return
+
+
+        # Get size of engagement log
+        n = len(response['Item']['engagement']['M']['timestamps']['L'])
+
+        client.update_item(
+            TableName=CURRENT_TABLE,
+            Key={'id': {'S': self.id}},
+            UpdateExpression=
+                'SET engagement.scores[{N}] = :s, engagement.num_comments[{N}] = :c, engagement.#ts[{N}] = :t, current_score = :s, current_num_comments = :c'
+                .format(N=n),
+            ExpressionAttributeNames={
+                "#ts": "timestamps"
+            },
+            ExpressionAttributeValues={
+                ":s": {"N": str(self.votes)},
+                ":c": {"N": str(self.comments)},
+                ":t": {"N": str(time.time())}
+            }
+        )
+
+    def is_in_db(self):
+        client = boto3.client('dynamodb')
+        response = client.get_item(
+            TableName=CURRENT_TABLE,
+            Key={'id': {'S': self.id}}
+        )
+        # This is the condition for 'presence' in the database
         return 'Item' in response
 
     def _load_file_in_s3_bucket(self, object_name):
@@ -285,7 +314,7 @@ class Image():
             }
         )
 
-    def _update_dynamodb(self, object_name):
+    def _put_dynamodb(self, object_name):
         ''' fields:
         "id": self.id # Primary Key
         "s3_key": object_name
@@ -299,48 +328,37 @@ class Image():
         } 
         '''
         client = boto3.client('dynamodb')
-        response = client.get_item(
+
+        client.put_item(
             TableName=CURRENT_TABLE,
-            Item={'id': {'S': self.id}}
-        )
-        print(response)
-        # put item for new ones, update item for old ones
-        if self.is_in_db(response):
-            # update item
-            num_scores = len(response['engagement']['scores'])
-            # we want to insert new scores, timestamps, and comments at the back of the list
-
-            # client.update_item(
-            #     TableName=CURRENT_TABLE,
-            #     Key={'id': {'S': self.id}},
-            #     UpdateExpression='SET resp'
-            # )
-        else:
-            client.put_item(
-                TableName=CURRENT_TABLE,
-                Item={
-                    'community': {'S': self.subreddit},
-                    'content_source': {'S': RedditScraper.get_source()},
-                    's3_key': {'S': object_name},
-                    's3_bucket': {'S': CURRENT_BUCKET},
-                    'image_url': {'S': self.url},
-                    'id': {'S': self.id}, # Primary Key
-                    'engagement': {
-                        'M': {
-                            "timestamps": {
-                                "L": [{'N': str(self.timestamp)}]
-                            },
-                            "scores": {
-                                "L": [{'N': str(self.votes)}]
-                            },
-                            "num_comments": {
-                                "L": [{'N': str(self.comments)}]
-                            },
-                        }
+            Item={
+                'community': {'S': self.subreddit},
+                'community_size': {'N': str(self.subreddit_size)},
+                'content_source': {'S': RedditScraper.get_source()},
+                'created': {'N': str(self.created)},
+                'current_score': {'N': str(self.votes)},
+                'current_num_comments': {'N': str(self.comments)},
+                's3_key': {'S': object_name},
+                's3_bucket': {'S': CURRENT_BUCKET},
+                'image_url': {'S': self.url},
+                'id': {'S': self.id}, # Primary Key
+                'associated_text': {'S': self.title},
+                'engagement': {
+                    'M': {
+                        "timestamps": {
+                            "L": [{'N': str(time.time())}]
+                        },
+                        "scores": {
+                            "L": [{'N': str(self.votes)}]
+                        },
+                        "num_comments": {
+                            "L": [{'N': str(self.comments)}]
+                        },
                     }
+                }
 
-                } 
-            )
+            } 
+        )
 
 
 
