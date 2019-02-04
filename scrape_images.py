@@ -65,7 +65,7 @@ class RedditScraper():
 
     def scrape_and_store(self, n=None):
         subreddit_json = self.get_hot_subreddit_response()
-        print(json.dumps(subreddit_json, indent=2))
+        # print(json.dumps(subreddit_json, indent=2))
         content = list(self.build_image_objects(subreddit_json))
         images = self.filter_images_from_content(content)
         new_images, old_images = self.filter_new_images(images)
@@ -161,6 +161,7 @@ class RedditScraper():
             # print(json.dumps(post, indent=2))
             yield Image(post_title, post_url, post_timestamp_utc, post_votes, post_comments, self.subreddit, subreddit_size, post)
 
+    # Wipes the current images
     def prepare_to_download_images(self):
         current_dir = get_current_dir()
         path = os.path.join(current_dir, os.path.join(self.subreddit, 'images'))
@@ -188,13 +189,19 @@ class RedditScraper():
         for image in images:
             try:
                 image.upload_image()
+                print(image.subreddit)
+                print(image.votes)
+                if image.should_post_to_instagram():
+                    print('trying to post')
+                    image.post_to_instagram()
+
             except FileNotFoundError: # is this really necessary
                 print("File not found for image {}".format(image.id))
                 continue
 
     def update_old_images(self, old_images):
         for image in old_images:
-            image.update_image() # can we get much simpler?
+            image.update_image() # can we get much simpler? yes -- with a lambda
 
     def update_existing_image_set_file(self, images):
         current_dir = get_current_dir()
@@ -288,6 +295,40 @@ class Image():
         )
         # This is the condition for 'presence' in the database
         return 'Item' in response
+
+
+    # These requirements will change over time - see analyze.py file for testing 
+    def should_post_to_instagram(self):
+        time_since_posted = time.time() - self.created
+        if time_since_posted > 10000:
+            return False
+
+        early_ups_ratio = self.votes / time_since_posted
+
+        return self.subreddit.lower() == "programmerhumor" and self.early_ups_ratio > .012
+
+
+    def post_to_instagram(self):
+        account_name = secrets.ACCOUNT_NAME_FOR_SUBREDDIT[self.subreddit]
+        account_password = secrets.ACCOUNT_PASSWORD_FOR_SUBREDDIT[self.subreddit]
+
+        # simply have to use the image path as the data for the form Image element in the post request (if this were a cURL)
+        current_dir = get_current_dir()
+        with open("{dir}/{sub}/images/{f}".format(
+            dir=current_dir, 
+            sub=self.subreddit, 
+            f=self.id), 'rb') as image_file:
+            form_file = {
+                'image': image_file
+            }
+            hashtags = secrets.HASHTAGS_FOR_SUBREDDIT[self.subreddit]
+            caption = self.title + "\n.\n.\n" + hashtags
+            payload = {
+                'caption': caption,
+                'username': account_name,
+                'password': account_password # or just give user auth_token or something
+            }
+            requests.post(secrets.API_URL + '/instant', files=form_file, data=payload)
 
     def _load_file_in_s3_bucket(self, object_name):
         client = boto3.client('s3')
